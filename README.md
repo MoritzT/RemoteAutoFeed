@@ -1,7 +1,5 @@
 # Remote Auto Feed
 
-![Remote Auto Feed](assets/banner.png)
-
 **Server-side UE4SS Lua mod for Palworld 1.0. Clients do not need to install the mod.**
 
 Remote Auto Feed prevents working base Pals from walking to a feed box whenever they become hungry. Palworld still selects the normal feed box and food; the server then uses Palworld's own item-use path to feed the Pal remotely, cancels the feed-box movement action, and lets the Pal continue working.
