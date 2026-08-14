@@ -4,6 +4,18 @@
 
 Remote Auto Feed prevents working base Pals from walking to a feed box whenever they become hungry. Palworld still selects the normal feed box and food; the server then uses Palworld's own item-use path to feed the Pal remotely, cancels the feed-box movement action, and lets the Pal continue working.
 
+## Download
+
+**[Download RemoteAutoFeed v1.0.0 — server only](https://github.com/MoritzT/RemoteAutoFeed/raw/refs/heads/main/dist/RemoteAutoFeed-v1.0.0-server-only.zip)**
+
+The ZIP is ready for manual UE4SS installation and contains the complete `RemoteAutoFeed` mod folder.
+
+SHA-256:
+
+```text
+9cbe6758a9c29fd0fb7ea493220f842bfcab3670947ee71cc78788502cbe5a0e
+```
+
 [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3783217681)
 
 ## Features
@@ -59,13 +71,16 @@ After enabling the Workshop item and UE4SS for the dedicated server, fully resta
 
 ## Manual UE4SS installation
 
-Copy the repository's `Scripts` directory and `enabled.txt` into:
+Extract the release ZIP so the server has:
 
 ```text
 ue4ss/
 └── Mods/
     └── RemoteAutoFeed/
         ├── enabled.txt
+        ├── LICENSE
+        ├── README.md
+        ├── CHANGELOG.md
         └── Scripts/
             ├── config.lua
             └── main.lua
