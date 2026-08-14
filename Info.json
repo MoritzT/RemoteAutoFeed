@@ -1,0 +1,25 @@
+{
+  "ModName": "Remote Auto Feed",
+  "PackageName": "RemoteAutoFeed",
+  "Thumbnail": "thumbnail.png",
+  "Version": "1.0.0",
+  "DebugMode": false,
+  "Author": "Moritz",
+  "Dependencies": [
+    "UE4SS"
+  ],
+  "Tags": [
+    "UE4SS",
+    "Gameplay",
+    "Utilities"
+  ],
+  "InstallRule": [
+    {
+      "Type": "Lua",
+      "IsServer": true,
+      "Targets": [
+        "./Scripts"
+      ]
+    }
+  ]
+}
