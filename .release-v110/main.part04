@@ -1,0 +1,529 @@
+        10000
+    )
+
+    if interval < 1000 then
+        interval = 1000
+    end
+
+    local scheduled, err = schedule(interval, function()
+        local ok, scanErr = pcall(function()
+            runStarvationWatch()
+        end)
+
+        if not ok then
+            log("WARNING | starvation watchdog failed | error=" .. tostring(scanErr))
+        end
+
+        scheduleStarvationWatch()
+    end)
+
+    if not scheduled then
+        log("WARNING | starvation watchdog scheduling failed | error=" .. tostring(err))
+    end
+end
+
+local function readHungryParameter(root, approach)
+    -- Preferred path: the concrete RecoverHungry root owns HungeryParameter.
+    local okRoot, p = pcall(function()
+        return root.HungeryParameter
+    end)
+
+    if okRoot and p ~= nil then
+        local recover = nil
+        local maxEat = nil
+
+        pcall(function()
+            recover = toNumber(p.RecoverSatietyTo)
+        end)
+
+        pcall(function()
+            maxEat = toNumber(p.EatMaxNum)
+        end)
+
+        if recover ~= nil then
+            return recover, maxEat, "root.HungeryParameter"
+        end
+    end
+
+    -- Fallback through the child helper.
+    if valid(approach) then
+        local out = {}
+
+        local ok = pcall(function()
+            approach:GetHungryParameter(out)
+        end)
+
+        if ok then
+            local p2 = out.HungeryParameter or out
+            local recover = nil
+            local maxEat = nil
+
+            pcall(function()
+                recover = toNumber(p2.RecoverSatietyTo)
+            end)
+
+            pcall(function()
+                maxEat = toNumber(p2.EatMaxNum)
+            end)
+
+            if recover ~= nil then
+                return recover, maxEat, "approach:GetHungryParameter"
+            end
+        end
+    end
+
+    return nil, nil, "unavailable"
+end
+
+local function findUsableFoodSlot(container, individualId)
+    local okNum, num = pcall(function()
+        return container:Num()
+    end)
+
+    if not okNum or type(num) ~= "number" then
+        return nil, nil, "container Num failed"
+    end
+
+    -- Preserve vanilla feed-box ordering.
+    for i = 0, num - 1 do
+        local okGet, slot = pcall(function()
+            return container:Get(i)
+        end)
+
+        if okGet and valid(slot) then
+            local okEmpty, empty = pcall(function()
+                return slot:IsEmpty()
+            end)
+
+            if okEmpty and not empty then
+                local okCan, canUse = pcall(function()
+                    return slot:CanUseItemToCharacter(individualId)
+                end)
+
+                if okCan and canUse == true then
+                    local stack = nil
+                    pcall(function()
+                        stack = slot:GetStackCount()
+                    end)
+
+                    return slot, toNumber(stack), nil
+                end
+            end
+        end
+    end
+
+    return nil, nil, "no usable food slot"
+end
+
+local function scheduleRootStateCleanup(key)
+    local delayMs = tonumber(config.CompletedStateRetentionMs) or 5000
+
+    if delayMs < 0 then
+        delayMs = 0
+    end
+
+    local ok = pcall(function()
+        ExecuteInGameThreadWithDelay(delayMs, function()
+            local state = rootState[key]
+            if state and state.status == "done" then
+                rootState[key] = nil
+            end
+        end)
+    end)
+
+    if not ok then
+        -- Cleanup failure is non-fatal; the entry is tiny and keyed by a
+        -- short-lived RecoverHungry root object.
+        debugLog("Could not schedule completed root-state cleanup.")
+    end
+end
+
+local function releaseContainerLock(state)
+    if not state or not state.containerKey then
+        return
+    end
+
+    if containerLocks[state.containerKey] == state.key then
+        containerLocks[state.containerKey] = nil
+
+        debugLog("Released feed-box container lock.")
+    end
+end
+
+local function acquireContainerLock(state)
+    local owner = containerLocks[state.containerKey]
+
+    if owner == nil or owner == state.key then
+        containerLocks[state.containerKey] = state.key
+        return true
+    end
+
+    return false
+end
+
+local function abandon(root, reason)
+    local key = fullName(root)
+
+    rootState[key] = {
+        status = "done",
+        result = "vanilla"
+    }
+
+    log("WARNING | remote feeding abandoned | reason=" .. tostring(reason))
+    debugLog("Vanilla feeding remains available for root=" .. key)
+    scheduleRootStateCleanup(key)
+end
+
+local function finishRemoteMeal(state)
+    local root = state.root
+
+    -- Free the feed-box serialization lock before ending the root so the next
+    -- queued hungry Pal can begin immediately.
+    releaseContainerLock(state)
+
+    -- Final aggressive cleanup of any approach child that reappeared.
+    cancelApproachMovement(root)
+
+    local endFull = getFullStomach(state.parameterComponent)
+    local startPct = percentOf(state.startFull, state.maxFullStomach)
+    local endPct = percentOf(endFull, state.maxFullStomach)
+    local targetPct = percentOf(state.effectiveTarget, state.maxFullStomach)
+
+    local ok, method = terminateRoot(root)
+
+    state.status = "done"
+    state.result = "remote"
+    rootState[state.key] = state
+
+    if config.MealLogging and state.bites > 0 then
+        local status = state.completionReason or "complete"
+
+        log(string.format(
+            "MEAL | Pal=%s | items=%d | fullness=%.1f%%->%.1f%% | target=%.1f%% | status=%s",
+            state.palLabel or "<unknown-pal>",
+            state.bites,
+            startPct or -1,
+            endPct or -1,
+            targetPct or (state.configuredPercent * 100.0),
+            tostring(status)
+        ))
+    end
+
+    if not ok then
+        log("WARNING | meal completed but hunger action termination failed | method=" ..
+            tostring(method))
+    else
+        debugLog("Hunger action ended via " .. tostring(method))
+    end
+
+    scheduleRootStateCleanup(state.key)
+end
+
+local function remoteFeedNext(state)
+    if not valid(state.root) then
+        releaseContainerLock(state)
+        rootState[state.key] = nil
+        return
+    end
+
+    -- If the parent tried to re-create Approach between bites, kill it again.
+    cancelApproachMovement(state.root)
+
+    local currentFull = getFullStomach(state.parameterComponent)
+
+    -- Never declare a hunger action complete without at least MinRemoteBites.
+    -- v0.10 showed that a stale/low RecoverSatietyTo can already be below the
+    -- Pal's current absolute FullStomach when the action reaches us.
+    if state.bites >= state.minBites and
+       currentFull ~= nil and
+       state.effectiveTarget ~= nil and
+       currentFull + config.SatietyEpsilon >= state.effectiveTarget then
+
+        local percent = nil
+        if state.maxFullStomach and state.maxFullStomach > 0 then
+            percent = (currentFull / state.maxFullStomach) * 100.0
+        end
+
+        debugLog(string.format(
+            "Satiety target reached: %.3f / %.3f (%.1f%%) >= %.3f",
+            currentFull,
+            state.maxFullStomach or -1,
+            percent or -1,
+            state.effectiveTarget
+        ))
+
+        state.completionReason = "complete"
+        finishRemoteMeal(state)
+        return
+    end
+
+    if state.bites >= state.hardLimit then
+        debugLog(string.format(
+            "Remote meal hard cap reached before target | Pal=%s | items=%d | batches=%d | target=%.1f%%",
+            state.palLabel or "<unknown-pal>",
+            state.bites,
+            state.batchNumber or 1,
+            (state.configuredPercent or 0) * 100.0
+        ))
+
+        -- This is a safe partial meal, not an item-use failure. End the current
+        -- hunger root cleanly and let Palworld schedule the next hunger cycle
+        -- if more food is still required.
+        state.completionReason = "partial"
+        finishRemoteMeal(state)
+        return
+    end
+
+    if state.batchBites >= state.batchLimit then
+        state.batchNumber = (state.batchNumber or 1) + 1
+        state.batchBites = 0
+
+        debugLog(string.format(
+            "Remote meal continuing with batch %d | Pal=%s | total_items=%d | batch_limit=%d",
+            state.batchNumber,
+            state.palLabel or "<unknown-pal>",
+            state.bites,
+            state.batchLimit
+        ))
+
+        local pause = math.floor(
+            tonumber(config.RemoteMealBatchPauseMs) or 100
+        )
+        if pause < 0 then pause = 0 end
+
+        local scheduledBatch, batchErr = schedule(pause, function()
+            remoteFeedNext(state)
+        end)
+
+        if not scheduledBatch then
+            log("WARNING | could not schedule next meal batch | error=" ..
+                tostring(batchErr))
+            state.completionReason = "schedule-failed"
+            finishRemoteMeal(state)
+        end
+        return
+    end
+
+    local slot, beforeStack, slotErr =
+        findUsableFoodSlot(state.container, state.individualId)
+
+    if not valid(slot) then
+        -- We already cancelled movement. End the current hunger root so it
+        -- can be reevaluated later; do not fabricate satiety.
+        log("WARNING | no usable food before target | Pal=" ..
+            tostring(state.palLabel) .. " | reason=" .. tostring(slotErr))
+        state.completionReason = "no-food"
+        finishRemoteMeal(state)
+        return
+    end
+
+    local beforeFull = currentFull
+
+    if beforeFull == nil then
+        beforeFull = getFullStomach(state.parameterComponent)
+    end
+
+    state.bites = state.bites + 1
+    state.batchBites = state.batchBites + 1
+    local biteNumber = state.bites
+    local batchBiteNumber = state.batchBites
+
+    local beforePercent = nil
+    if beforeFull ~= nil and state.maxFullStomach and state.maxFullStomach > 0 then
+        beforePercent = (beforeFull / state.maxFullStomach) * 100.0
+    end
+
+    debugLog(string.format(
+        "Remote bite total=%d/%d batch=%d bite=%d/%d | Pal=%s | stack=%s | full_stomach=%s/%s (%.1f%%) | target=%.3f",
+        biteNumber,
+        state.hardLimit,
+        state.batchNumber or 1,
+        batchBiteNumber,
+        state.batchLimit,
+        state.palLabel or "<unknown-pal>",
+        tostring(beforeStack),
+        tostring(beforeFull),
+        tostring(state.maxFullStomach),
+        beforePercent or -1,
+        state.effectiveTarget
+    ))
+
+    local okUse, useErr = pcall(function()
+        slot:RequestUseToCharacter(state.individualId, 1)
+    end)
+
+    if not okUse then
+        log("WARNING | RequestUseToCharacter failed | Pal=" ..
+            tostring(state.palLabel) .. " | error=" .. tostring(useErr))
+        state.completionReason = "item-use-failed"
+        finishRemoteMeal(state)
+        return
+    end
+
+    local scheduled, err = schedule(config.VerifyDelayMs, function()
+        if not valid(state.root) then
+            releaseContainerLock(state)
+            rootState[state.key] = nil
+            return
+        end
+
+        local afterStack = nil
+        if valid(slot) then
+            pcall(function()
+                afterStack = toNumber(slot:GetStackCount())
+            end)
+        end
+
+        local afterFull = getFullStomach(state.parameterComponent)
+
+        local stackDecreased =
+            beforeStack ~= nil and afterStack ~= nil and
+            afterStack < beforeStack
+
+        local fullnessIncreased =
+            beforeFull ~= nil and afterFull ~= nil and
+            afterFull > beforeFull + config.SatietyEpsilon
+
+        debugLog(string.format(
+            "Bite %d verification | Pal=%s | stack %s -> %s | full_stomach %s -> %s",
+            biteNumber,
+            state.palLabel or "<unknown-pal>",
+            tostring(beforeStack),
+            tostring(afterStack),
+            tostring(beforeFull),
+            tostring(afterFull)
+        ))
+
+        -- Fullness belongs to this exact Pal, so it is the authoritative
+        -- success signal. A shared feed-box stack can be changed by another Pal
+        -- and is therefore diagnostic only.
+        if not fullnessIncreased then
+            log(string.format(
+                "WARNING | bite did not increase FullStomach | Pal=%s | stack_changed=%s",
+                state.palLabel or "<unknown-pal>",
+                tostring(stackDecreased)
+            ))
+            state.completionReason = "verification-failed"
+            finishRemoteMeal(state)
+            return
+        end
+
+        -- Continue until the normalized target or total hard safety cap says stop.
+        local scheduledNext, nextErr =
+            schedule(config.BetweenBitesDelayMs, function()
+                remoteFeedNext(state)
+            end)
+
+        if not scheduledNext then
+            log("WARNING | could not schedule next bite | error=" ..
+                tostring(nextErr))
+            state.completionReason = "schedule-failed"
+            finishRemoteMeal(state)
+        end
+    end)
+
+    if not scheduled then
+        log("WARNING | could not schedule bite verification | error=" .. tostring(err))
+        state.completionReason = "schedule-failed"
+        finishRemoteMeal(state)
+    end
+end
+
+local function startWhenContainerAvailable(state)
+    if not valid(state.root) then
+        rootState[state.key] = nil
+        return
+    end
+
+    -- Keep any re-created approach/navigation child suppressed while waiting.
+    cancelApproachMovement(state.root)
+
+    if acquireContainerLock(state) then
+        state.status = "feeding"
+
+        debugLog("Acquired feed-box container lock; starting remote meal.")
+        remoteFeedNext(state)
+        return
+    end
+
+    if not state.queueLogged then
+        state.queueLogged = true
+        debugLog("Feed box is already serving another Pal; remote meal queued.")
+    end
+
+    local scheduled, err = schedule(config.ContainerQueueRetryMs, function()
+        startWhenContainerAvailable(state)
+    end)
+
+    if not scheduled then
+        log("WARNING | could not schedule feed-box queue retry | error=" .. tostring(err))
+        state.completionReason = "queue-schedule-failed"
+        finishRemoteMeal(state)
+    end
+end
+
+local function beginRemoteMeal(root, approach, target, attempt)
+    local key = fullName(root)
+
+    local character = getCharacter(root, approach)
+    if not valid(character) then
+        abandon(root, "could not resolve Pal character")
+        return
+    end
+
+    local container, containerErr = getFeedContainer(target)
+    if not valid(container) then
+        abandon(root, containerErr)
+        return
+    end
+
+    local parameterComponent, individualId, idErr =
+        getPalUseContext(character)
+
+    if not valid(parameterComponent) or individualId == nil then
+        abandon(root, idErr)
+        return
+    end
+
+    local recoverSatietyTo, eatMaxNum, paramSource =
+        readHungryParameter(root, approach)
+
+    if recoverSatietyTo == nil then
+        -- Don't cancel the vanilla walk unless we know the vanilla floor.
+        abandon(root, "could not read RecoverSatietyTo")
+        return
+    end
+
+    local maxFullStomach = getMaxFullStomach(parameterComponent)
+
+    if maxFullStomach == nil then
+        abandon(root, "could not read GetMaxFullStomach()")
+        return
+    end
+
+    local configuredPercent = tonumber(config.TargetSatietyPercent) or 0.80
+    configuredPercent = math.max(0.01, math.min(configuredPercent, 1.0))
+
+    local percentageTarget = maxFullStomach * configuredPercent
+
+    -- Preserve any higher special-case vanilla recovery target, but do not let
+    -- a low/stale absolute RecoverSatietyTo result in an underfed Pal.
+    local effectiveTarget = math.max(
+        recoverSatietyTo,
+        percentageTarget
+    )
+
+    -- Never request more than the Pal's physical capacity as our target.
+    effectiveTarget = math.min(effectiveTarget, maxFullStomach)
+
+    local minBites = math.max(
+        1,
+        math.floor(tonumber(config.MinRemoteBites) or 1)
+    )
+
+    local hardLimit = math.floor(
+        tonumber(config.HardMaxRemoteBites) or 40
+    )
+    hardLimit = math.max(minBites, hardLimit)
+
+    -- EatMaxNum is the vanilla meal-size guard. Keep it as a per-batch siz
