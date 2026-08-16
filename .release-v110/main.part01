@@ -1,0 +1,363 @@
+local config = require("config")
+local UEHelpers = require("UEHelpers")
+
+local MOD_NAME = "RemoteAutoFeed"
+
+local ROOT_CLASS =
+    "/Game/Pal/Blueprint/Controller/AIAction/BaseCamp/RecoverHungry/" ..
+    "BP_AIAction_BaseCampRecoverHungry.BP_AIAction_BaseCampRecoverHungry_C"
+
+local ROOT_APPROACH_FUNCTION =
+    ROOT_CLASS .. ":ChangeActionApproach"
+
+local hooksRegistered = false
+local hookRegistrationAttempted = false
+
+-- Latest concrete ApproachToFoodBox action per PalAIActionComponent.
+local approachByComponent = {}
+
+-- Root state:
+--   pending  = waiting for target initialization
+--   feeding  = remote meal in progress
+--   done     = completed/abandoned
+local rootState = {}
+
+-- One complete remote meal at a time per physical feed-box container.
+-- Different feed boxes can still feed concurrently.
+local containerLocks = {}
+
+local KismetSystemLibrary = UEHelpers.GetKismetSystemLibrary()
+
+local function log(message)
+    print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
+end
+
+local function debugLog(message)
+    if config.DebugLogging then
+        log("DEBUG | " .. tostring(message))
+    end
+end
+
+local function unwrap(value)
+    if value == nil then
+        return nil
+    end
+
+    local ok, result = pcall(function()
+        return value:get()
+    end)
+
+    if ok and result ~= nil then
+        return result
+    end
+
+    return value
+end
+
+local function valid(obj)
+    if obj == nil then
+        return false
+    end
+
+    local ok, result = pcall(function()
+        return obj:IsValid()
+    end)
+
+    return ok and result == true
+end
+
+local function fullName(obj)
+    obj = unwrap(obj)
+
+    if not valid(obj) then
+        return "<invalid>"
+    end
+
+    local ok, result = pcall(function()
+        return obj:GetFullName()
+    end)
+
+    if ok and result then
+        return tostring(result)
+    end
+
+    return "<name-error>"
+end
+
+local function palLabel(character)
+    local name = fullName(character)
+    local first = string.match(name, "^(%S+)")
+    return first or "<unknown-pal>"
+end
+
+local function percentOf(value, maximum)
+    if type(value) ~= "number" or type(maximum) ~= "number" or maximum <= 0 then
+        return nil
+    end
+
+    return (value / maximum) * 100.0
+end
+
+local function classFullName(obj)
+    obj = unwrap(obj)
+
+    if not valid(obj) then
+        return "<invalid-class>"
+    end
+
+    local ok, cls = pcall(function()
+        return obj:GetClass()
+    end)
+
+    if not ok or not valid(cls) then
+        return "<class-error>"
+    end
+
+    return fullName(cls)
+end
+
+local function getOuter(obj)
+    obj = unwrap(obj)
+
+    if not valid(obj) then
+        return nil
+    end
+
+    local ok, outer = pcall(function()
+        return obj:GetOuter()
+    end)
+
+    if ok and valid(outer) then
+        return outer
+    end
+
+    return nil
+end
+
+local function toNumber(value)
+    value = unwrap(value)
+
+    if type(value) == "number" then
+        return value
+    end
+
+    local n = tonumber(value)
+    return n
+end
+
+local function isDedicatedServer(worldContext)
+    if not config.RequireDedicatedServer then
+        return true
+    end
+
+    if not KismetSystemLibrary or not valid(KismetSystemLibrary) then
+        return false
+    end
+
+    local ok, result = pcall(function()
+        return KismetSystemLibrary:IsDedicatedServer(worldContext)
+    end)
+
+    return ok and result == true
+end
+
+local function schedule(delayMs, callback)
+    local ok, handleOrErr = pcall(function()
+        return ExecuteInGameThreadWithDelay(delayMs, callback)
+    end)
+
+    if not ok then
+        return false, tostring(handleOrErr)
+    end
+
+    return true, handleOrErr
+end
+
+local function getApproachForRoot(root)
+    local component = getOuter(root)
+
+    if not valid(component) then
+        return nil
+    end
+
+    return approachByComponent[fullName(component)]
+end
+
+local function getCharacter(root, approach)
+    for _, action in ipairs({ approach, root }) do
+        if valid(action) then
+            local ok, character = pcall(function()
+                return action:GetCharacter()
+            end)
+
+            if ok and valid(character) then
+                return character
+            end
+        end
+    end
+
+    local component = getOuter(root)
+
+    if valid(component) then
+        local okOwner, controller = pcall(function()
+            return component:GetOwner()
+        end)
+
+        if okOwner and valid(controller) then
+            local okPawn, pawn = pcall(function()
+                return controller:GetPawn()
+            end)
+
+            if okPawn and valid(pawn) then
+                return pawn
+            end
+        end
+    end
+
+    return nil
+end
+
+local function stopMovement(root)
+    local component = getOuter(root)
+
+    if not valid(component) then
+        return false
+    end
+
+    local okOwner, controller = pcall(function()
+        return component:GetOwner()
+    end)
+
+    if not okOwner or not valid(controller) then
+        return false
+    end
+
+    return pcall(function()
+        controller:StopMovement()
+    end)
+end
+
+-- Kill the concrete feed-box walking child, not merely the parent.
+local function cancelApproachMovement(root)
+    if not valid(root) then
+        return false
+    end
+
+    local component = getOuter(root)
+    if not valid(component) then
+        return false
+    end
+
+    local cancelledSomething = false
+    local approach = getApproachForRoot(root)
+
+    if valid(approach) then
+        local okClass, approachClass = pcall(function()
+            return approach:GetClass()
+        end)
+
+        if okClass and valid(approachClass) then
+            local okTerminate = pcall(function()
+                component:TerminateCurrentActionByClass(approachClass)
+            end)
+
+            if okTerminate then
+                cancelledSomething = true
+            end
+        end
+    end
+
+    -- The Approach child is pushed by the RecoverHungry root. The current
+    -- PalAIActionComponent exposes this specifically for pushed actions.
+    local okCancelPushed = pcall(function()
+        component:AllCancelPushedAction(root)
+    end)
+
+    if okCancelPushed then
+        cancelledSomething = true
+    end
+
+    if stopMovement(root) then
+        cancelledSomething = true
+    end
+
+    return cancelledSomething
+end
+
+local function terminateRoot(root)
+    if not valid(root) then
+        return false, "root invalid"
+    end
+
+    local component = getOuter(root)
+
+    if not valid(component) then
+        return false, "AI action component invalid"
+    end
+
+    local okClass, rootClass = pcall(function()
+        return root:GetClass()
+    end)
+
+    if okClass and valid(rootClass) then
+        local okTerminate, err = pcall(function()
+            component:TerminateCurrentActionByClass(rootClass)
+        end)
+
+        if okTerminate then
+            stopMovement(root)
+            return true, "TerminateCurrentActionByClass"
+        end
+
+        if config.DebugLogging then
+            log("Root TerminateCurrentActionByClass error: " .. tostring(err))
+        end
+    end
+
+    local okWorker, workerErr = pcall(function()
+        root:ChangeActionToWorker()
+    end)
+
+    if okWorker then
+        stopMovement(root)
+        return true, "ChangeActionToWorker"
+    end
+
+    return false, tostring(workerErr)
+end
+
+local function tryGetSelectedFeedBox(approach)
+    if not valid(approach) then
+        return nil, "approach unavailable"
+    end
+
+    local outTarget = {}
+
+    local ok, success = pcall(function()
+        return approach:TryGetTargetMapObjectConcreteModel(outTarget)
+    end)
+
+    if not ok then
+        return nil, "TryGetTargetMapObjectConcreteModel call failed: " ..
+            tostring(success)
+    end
+
+    if success ~= true then
+        return nil, "target-not-ready"
+    end
+
+    local target = outTarget.OutTargetModel
+
+    if not valid(target) then
+        return nil, "target-invalid"
+    end
+
+    return target, nil
+end
+
+local function getFeedContainer(target)
+    local okModule, module = pcall(function()
+        return target:GetItemContainerModule()
+    end)
+
+  
