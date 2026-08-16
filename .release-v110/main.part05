@@ -1,0 +1,327 @@
+e,
+    -- but allow another immediate batch when a low-nutrition food cannot reach
+    -- the configured target in one batch. HardMaxRemoteBites remains the total
+    -- safety ceiling for this remote meal.
+    local batchLimit = hardLimit
+
+    if eatMaxNum ~= nil and eatMaxNum > 0 then
+        batchLimit = math.min(
+            math.floor(eatMaxNum),
+            hardLimit
+        )
+    end
+
+    if batchLimit < minBites then
+        batchLimit = minBites
+    end
+
+    debugLog(string.format(
+        "Feed-box target ready on attempt %d.",
+        attempt
+    ))
+    debugLog("Remote meal initialized:")
+    debugLog("  Pal:    " .. fullName(character))
+    debugLog("  Target: " .. fullName(target))
+    local currentFull = getFullStomach(parameterComponent)
+    local currentPercent = nil
+    if currentFull ~= nil and maxFullStomach > 0 then
+        currentPercent = (currentFull / maxFullStomach) * 100.0
+    end
+
+    debugLog(string.format(
+        "  Current=%s Max=%s CurrentPct=%.1f%%",
+        tostring(currentFull),
+        tostring(maxFullStomach),
+        currentPercent or -1
+    ))
+    debugLog(string.format(
+        "  VanillaRecover=%s PercentTarget=%.1f%% => %.3f EffectiveTarget=%.3f",
+        tostring(recoverSatietyTo),
+        configuredPercent * 100.0,
+        percentageTarget,
+        effectiveTarget
+    ))
+    debugLog(string.format(
+        "  EatMaxNum=%s BatchLimit=%d HardLimit=%d MinRemoteBites=%d source=%s",
+        tostring(eatMaxNum),
+        batchLimit,
+        hardLimit,
+        minBites,
+        tostring(paramSource)
+    ))
+
+    local containerKey = fullName(container)
+
+    rootState[key] = {
+        status = "queued",
+        key = key,
+        root = root,
+        character = character,
+        approach = approach,
+        target = target,
+        container = container,
+        containerKey = containerKey,
+        parameterComponent = parameterComponent,
+        individualId = individualId,
+        palLabel = palLabel(character),
+        startFull = currentFull,
+        recoverSatietyTo = recoverSatietyTo,
+        maxFullStomach = maxFullStomach,
+        configuredPercent = configuredPercent,
+        percentageTarget = percentageTarget,
+        effectiveTarget = effectiveTarget,
+        minBites = minBites,
+        batchLimit = batchLimit,
+        hardLimit = hardLimit,
+        batchNumber = 1,
+        batchBites = 0,
+        bites = 0,
+    }
+
+    -- Critical v0.10 change:
+    -- cancel the concrete Approach child once its target has initialized.
+    cancelApproachMovement(root)
+
+    debugLog("Concrete ApproachToFoodBox movement cancelled.")
+
+    startWhenContainerAvailable(rootState[key])
+end
+
+local function resolveTarget(root, attempt)
+    if not valid(root) then
+        return
+    end
+
+    local key = fullName(root)
+    local state = rootState[key]
+
+    if not state or state.status ~= "pending" then
+        return
+    end
+
+    local approach = getApproachForRoot(root)
+
+    if valid(approach) then
+        local target, targetErr = tryGetSelectedFeedBox(approach)
+
+        if valid(target) then
+            beginRemoteMeal(root, approach, target, attempt)
+            return
+        end
+
+        if targetErr ~= "target-not-ready" and
+           targetErr ~= "target-invalid" then
+            abandon(root, targetErr)
+            return
+        end
+    end
+
+    if attempt >= config.TargetResolveMaxAttempts then
+        abandon(
+            root,
+            string.format(
+                "feed-box target unavailable after %d attempts",
+                attempt
+            )
+        )
+        return
+    end
+
+    if config.DebugLogging and
+       (attempt == 0 or attempt == 1 or attempt % 5 == 0) then
+        debugLog(string.format(
+            "Feed-box target not ready yet; retry %d/%d.",
+            attempt,
+            config.TargetResolveMaxAttempts
+        ))
+    end
+
+    local scheduled, err =
+        schedule(config.TargetResolveRetryMs, function()
+            resolveTarget(root, attempt + 1)
+        end)
+
+    if not scheduled then
+        abandon(root, "target retry scheduling failed: " .. tostring(err))
+    end
+end
+
+-- /Game hook executes after ChangeActionApproach.
+local function onBlueprintChangeActionApproach(Context)
+    local root = unwrap(Context)
+
+    if not valid(root) or not isDedicatedServer(root) then
+        return
+    end
+
+    local key = fullName(root)
+    local state = rootState[key]
+
+    if state and
+       (state.status == "feeding" or state.status == "queued") then
+        -- Parent reasserted Approach while the remote meal is underway/queued.
+        -- Kill the newly created child immediately.
+        cancelApproachMovement(root)
+
+        if not state.reentryLogged then
+            state.reentryLogged = true
+            debugLog("Approach re-entry suppressed during remote meal.")
+        end
+
+        return
+    end
+
+    if state ~= nil then
+        return
+    end
+
+    rootState[key] = {
+        status = "pending"
+    }
+
+    local character = getCharacter(root, getApproachForRoot(root))
+    local parameterComponent = getParameterComponent(character)
+    local full = getFullStomach(parameterComponent)
+    local maximum = getMaxFullStomach(parameterComponent)
+    local percent = percentOf(full, maximum)
+
+    debugLog(string.format(
+        "APPROACH_HOOK | Pal=%s | fullness=%s | root=%s",
+        valid(character) and palLabel(character) or "<unknown-pal>",
+        percent ~= nil and string.format("%.1f%%", percent) or "n/a",
+        key
+    ))
+    debugLog("Waiting for vanilla feed-box target initialization.")
+
+    resolveTarget(root, 0)
+end
+
+local function registerBlueprintHooks()
+    if hooksRegistered or hookRegistrationAttempted then
+        return hooksRegistered
+    end
+
+    hookRegistrationAttempted = true
+
+    local ok, id1, id2 = pcall(function()
+        return RegisterHook(
+            ROOT_APPROACH_FUNCTION,
+            onBlueprintChangeActionApproach
+        )
+    end)
+
+    if not ok then
+        log("ERROR | failed to hook concrete ChangeActionApproach")
+        log("ERROR | " .. tostring(id1))
+        return false
+    end
+
+    hooksRegistered = true
+
+    debugLog(string.format(
+        "Hooked concrete BP ChangeActionApproach (%s, %s)",
+        tostring(id1),
+        tostring(id2)
+    ))
+
+    return true
+end
+
+local function inspectActionObject(obj)
+    if not valid(obj) then
+        return
+    end
+
+    local cls = classFullName(obj)
+
+    if string.find(
+        cls,
+        "BP_AIAction_BaseCampRecoverHungry_ApproachToFoodBox_C",
+        1,
+        true
+    ) then
+        local outer = getOuter(obj)
+
+        if valid(outer) then
+            approachByComponent[fullName(outer)] = obj
+        end
+
+        logApproachObjectDiagnostic(obj)
+        return
+    end
+
+    if string.find(
+        cls,
+        "BP_AIAction_BaseCampRecoverHungry_C",
+        1,
+        true
+    ) then
+        logRecoverRootDiagnostic(obj)
+        registerBlueprintHooks()
+    end
+end
+
+if not config.Enabled then
+    log("Disabled in config.lua")
+    return
+end
+
+log(string.format(
+    "Starting v1.1.0 | target=%.0f%% | safety=%s | meal_logging=%s | debug=%s",
+    (tonumber(config.TargetSatietyPercent) or 0.90) * 100.0,
+    tostring(config.SafetyNetEnabled == true),
+    tostring(config.MealLogging == true),
+    tostring(config.DebugLogging == true)
+))
+
+if type(ExecuteInGameThreadWithDelay) ~= "function" then
+    log("ERROR | delayed game-thread API unavailable.")
+    return
+end
+
+local notifyOK, notifyErr = pcall(function()
+    NotifyOnNewObject("/Script/Pal.PalAIActionBase", function(obj)
+        local ok, err = pcall(function()
+            inspectActionObject(obj)
+        end)
+
+        if not ok then
+            log("WARNING | action watcher callback failed | error=" .. tostring(err))
+        end
+    end)
+end)
+
+if not notifyOK then
+    log("ERROR | action watcher registration failed | error=" .. tostring(notifyErr))
+    return
+end
+
+pcall(function()
+    local actions = FindAllOf("PalAIActionBase")
+
+    if actions then
+        for _, action in ipairs(actions) do
+            inspectActionObject(action)
+        end
+    end
+end)
+
+if (config.DebugLogging and config.DebugStarvationWatchEnabled == true) or
+   config.SafetyNetEnabled == true then
+    debugLog(string.format(
+        "Starvation watchdog enabled | interval=%dms | threshold=%.0f%% | safety=%s | safety_trigger=%.0f%% | worker_filter=%s | hard_bites=%d",
+        math.floor(
+            tonumber(config.SafetyNetCheckIntervalMs) or
+            tonumber(config.DebugStarvationWatchIntervalMs) or
+            10000
+        ),
+        (tonumber(config.DebugStarvationWatchThresholdPercent) or 0.50) * 100.0,
+        tostring(config.SafetyNetEnabled == true),
+        (tonumber(config.SafetyNetTriggerPercent) or 0.30) * 100.0,
+        tostring(config.AuthoritativeWorkerFilter == true),
+        math.floor(tonumber(config.HardMaxRemoteBites) or 40)
+    ))
+    scheduleStarvationWatch()
+end
+
+debugLog("Loaded.")
