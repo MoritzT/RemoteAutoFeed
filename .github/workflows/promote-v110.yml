@@ -1,0 +1,41 @@
+name: Promote v1.1.0 runtime source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/promote-v110.yml
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify v1.1.0 package
+        shell: bash
+        run: |
+          echo "9c318770224f60b8778d5cc3e4eb409cdcc7aa6150f5bdf7bd27fd571b862ea9  dist/RemoteAutoFeed-v1.1.0-server-only.zip" | sha256sum -c -
+
+      - name: Sync exact runtime source from tested package
+        shell: bash
+        run: |
+          unzip -p dist/RemoteAutoFeed-v1.1.0-server-only.zip RemoteAutoFeed/Scripts/main.lua > Scripts/main.lua
+          unzip -p dist/RemoteAutoFeed-v1.1.0-server-only.zip RemoteAutoFeed/Scripts/config.lua > Scripts/config.lua
+          grep -q 'Starting v1.1.0' Scripts/main.lua
+          grep -q 'SafetyNetEnabled = true' Scripts/config.lua
+          grep -q 'HardMaxRemoteBites = 40' Scripts/config.lua
+
+      - name: Commit synchronized source and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/promote-v110.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Sync v1.1.0 runtime source"
+          git push
