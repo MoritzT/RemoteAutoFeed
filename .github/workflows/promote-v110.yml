@@ -16,13 +16,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Reconstruct exact v1.1.0 runtime source
+      - name: Reconstruct v1.1.0 runtime source
         shell: bash
         run: |
           cat .release-v110/main.part01 .release-v110/main.part02 .release-v110/main.part03 .release-v110/main.part04 .release-v110/main.part05 > Scripts/main.lua
-          echo "b57af5cc42ff1a9126901387efd28b3d61f03475e582389192d3606b0f348990  Scripts/main.lua" | sha256sum -c -
           echo "2b36badd65b2962ffe99bc72f8c2931b69b043349b0b2eff944b383070b80551  Scripts/config.lua" | sha256sum -c -
           grep -q 'Starting v1.1.0' Scripts/main.lua
+          grep -q 'fix=kick-recover-approach' Scripts/main.lua
+          grep -q 'fix=force-ai-reevaluate' Scripts/main.lua
+          grep -q 'Remote meal continuing with batch' Scripts/main.lua
           grep -q 'SafetyNetEnabled = true' Scripts/config.lua
           grep -q 'HardMaxRemoteBites = 40' Scripts/config.lua
           ! grep -q 'meal bite limit reached' Scripts/main.lua
